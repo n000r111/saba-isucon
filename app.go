@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
@@ -37,7 +38,23 @@ var (
 		posts  *template.Template
 		post   *template.Template
 	}{}
+
+	// 画像のキャッシュ
+	imageCache = struct {
+		sync.RWMutex
+		data    map[string]*cacheEntry
+		maxSize int64
+		curSize int64
+	}{
+		data:    make(map[string]*cacheEntry),
+		maxSize: 100 * 1024 * 1024, // 100MB
+	}
 )
+
+type cacheEntry struct {
+	data    []byte
+	lastUse time.Time
+}
 
 const (
 	postsPerPage  = 20
@@ -760,6 +777,9 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// キャッシュをクリア
+	clearImageCache()
+
 	pid, err := result.LastInsertId()
 	if err != nil {
 		log.Print(err)
@@ -767,6 +787,58 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
+}
+
+// キャッシュのエントリを追加
+func addToCache(key string, data []byte) {
+	imageCache.Lock()
+	defer imageCache.Unlock()
+
+	// 新しいデータのサイズ
+	newSize := int64(len(data))
+
+	// キャッシュが一杯の場合、古いエントリを削除
+	for imageCache.curSize+newSize > imageCache.maxSize {
+		var oldestKey string
+		var oldestTime time.Time
+		for k, v := range imageCache.data {
+			if oldestKey == "" || v.lastUse.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = v.lastUse
+			}
+		}
+		if oldestKey != "" {
+			imageCache.curSize -= int64(len(imageCache.data[oldestKey].data))
+			delete(imageCache.data, oldestKey)
+		} else {
+			break
+		}
+	}
+
+	// 新しいエントリを追加
+	imageCache.data[key] = &cacheEntry{
+		data:    data,
+		lastUse: time.Now(),
+	}
+	imageCache.curSize += newSize
+}
+
+// キャッシュからエントリを取得
+func getFromCache(key string) ([]byte, bool) {
+	imageCache.RLock()
+	entry, found := imageCache.data[key]
+	imageCache.RUnlock()
+
+	if !found {
+		return nil, false
+	}
+
+	// 最終使用時間を更新
+	imageCache.Lock()
+	entry.lastUse = time.Now()
+	imageCache.Unlock()
+
+	return entry.data, true
 }
 
 func getImage(w http.ResponseWriter, r *http.Request) {
@@ -777,28 +849,62 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	post := Post{}
-	err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-
 	ext := r.PathValue("ext")
+	cacheKey := fmt.Sprintf("%d.%s", pid, ext)
 
-	if ext == "jpg" && post.Mime == "image/jpeg" ||
-		ext == "png" && post.Mime == "image/png" ||
-		ext == "gif" && post.Mime == "image/gif" {
-		w.Header().Set("Content-Type", post.Mime)
-		_, err := w.Write(post.Imgdata)
+	// キャッシュから画像を取得
+	imgdata, found := getFromCache(cacheKey)
+
+	if !found {
+		// キャッシュにない場合はDBから取得
+		post := Post{}
+		err := db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
 		if err != nil {
 			log.Print(err)
 			return
 		}
-		return
+
+		if ext == "jpg" && post.Mime == "image/jpeg" ||
+			ext == "png" && post.Mime == "image/png" ||
+			ext == "gif" && post.Mime == "image/gif" {
+			imgdata = post.Imgdata
+
+			// キャッシュに保存
+			addToCache(cacheKey, imgdata)
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 	}
 
-	w.WriteHeader(http.StatusNotFound)
+	// 画像を返す
+	w.Header().Set("Content-Type", getMimeType(ext))
+	_, err = w.Write(imgdata)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+}
+
+func getMimeType(ext string) string {
+	switch ext {
+	case "jpg":
+		return "image/jpeg"
+	case "png":
+		return "image/png"
+	case "gif":
+		return "image/gif"
+	default:
+		return ""
+	}
+}
+
+// キャッシュをクリアする関数
+func clearImageCache() {
+	imageCache.Lock()
+	imageCache.data = make(map[string]*cacheEntry)
+	imageCache.curSize = 0
+	imageCache.Unlock()
 }
 
 func postComment(w http.ResponseWriter, r *http.Request) {
