@@ -1,11 +1,20 @@
 package main
 
 import (
+	"bytes"
 	crand "crypto/rand"
+	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
 	"fmt"
 	"html/template"
+	"image"
+	"image/gif"
+	_ "image/gif"
+	"image/jpeg"
+	_ "image/jpeg"
+	"image/png"
+	_ "image/png"
 	"io"
 	"log"
 	"net/http"
@@ -24,6 +33,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
 	"github.com/jmoiron/sqlx"
+	"github.com/nfnt/resize"
 )
 
 var (
@@ -60,6 +70,7 @@ const (
 	postsPerPage  = 20
 	ISO8601Format = "2006-01-02T15:04:05-07:00"
 	UploadLimit   = 10 * 1024 * 1024 // 10mb
+	MaxImageSize  = 800              // 最大画像サイズ
 )
 
 type User struct {
@@ -584,40 +595,23 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	commentCount := 0
-	err = db.Get(&commentCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?", user.ID)
+	// ユーザーの統計情報を1つのクエリで取得
+	type UserStats struct {
+		PostCount      int `db:"post_count"`
+		CommentCount   int `db:"comment_count"`
+		CommentedCount int `db:"commented_count"`
+	}
+
+	var stats UserStats
+	err = db.Get(&stats, `
+		SELECT 
+			(SELECT COUNT(*) FROM posts WHERE user_id = ?) as post_count,
+			(SELECT COUNT(*) FROM comments WHERE user_id = ?) as comment_count,
+			(SELECT COUNT(DISTINCT post_id) FROM comments WHERE post_id IN (SELECT id FROM posts WHERE user_id = ?)) as commented_count
+	`, user.ID, user.ID, user.ID)
 	if err != nil {
 		log.Print(err)
 		return
-	}
-
-	postIDs := []int{}
-	err = db.Select(&postIDs, "SELECT `id` FROM `posts` WHERE `user_id` = ?", user.ID)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	postCount := len(postIDs)
-
-	commentedCount := 0
-	if postCount > 0 {
-		s := []string{}
-		for range postIDs {
-			s = append(s, "?")
-		}
-		placeholder := strings.Join(s, ", ")
-
-		// convert []int -> []interface{}
-		args := make([]interface{}, len(postIDs))
-		for i, v := range postIDs {
-			args[i] = v
-		}
-
-		err = db.Get(&commentedCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ("+placeholder+")", args...)
-		if err != nil {
-			log.Print(err)
-			return
-		}
 	}
 
 	me := getSessionUser(r)
@@ -629,7 +623,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		CommentCount   int
 		CommentedCount int
 		Me             User
-	}{posts, user, postCount, commentCount, commentedCount, me})
+	}{posts, user, stats.PostCount, stats.CommentCount, stats.CommentedCount, me})
 }
 
 func getPosts(w http.ResponseWriter, r *http.Request) {
@@ -707,6 +701,39 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}{p, me})
 }
 
+// 画像をリサイズする関数
+func resizeImage(imgData []byte, mime string) ([]byte, error) {
+	// 画像をデコード
+	img, _, err := image.Decode(bytes.NewReader(imgData))
+	if err != nil {
+		return nil, err
+	}
+
+	// 画像をリサイズ
+	resized := resize.Resize(MaxImageSize, MaxImageSize, img, resize.Lanczos3)
+
+	// リサイズした画像をエンコード
+	var buf bytes.Buffer
+	switch mime {
+	case "image/jpeg":
+		if err := jpeg.Encode(&buf, resized, &jpeg.Options{Quality: 85}); err != nil {
+			return nil, err
+		}
+	case "image/png":
+		if err := png.Encode(&buf, resized); err != nil {
+			return nil, err
+		}
+	case "image/gif":
+		if err := gif.Encode(&buf, resized, nil); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unsupported image type: %s", mime)
+	}
+
+	return buf.Bytes(), nil
+}
+
 func postIndex(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 	if !isLogin(me) {
@@ -731,7 +758,6 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 
 	mime := ""
 	if file != nil {
-		// 投稿のContent-Typeからファイルのタイプを決定する
 		contentType := header.Header["Content-Type"][0]
 		if strings.Contains(contentType, "jpeg") {
 			mime = "image/jpeg"
@@ -764,12 +790,20 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 画像をリサイズ
+	resizedData, err := resizeImage(filedata, mime)
+	if err != nil {
+		log.Printf("Failed to resize image: %v", err)
+		// リサイズに失敗した場合は元の画像を使用
+		resizedData = filedata
+	}
+
 	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
 	result, err := db.Exec(
 		query,
 		me.ID,
 		mime,
-		filedata,
+		resizedData,
 		r.FormValue("body"),
 	)
 	if err != nil {
@@ -877,8 +911,19 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 画像を返す
+	// キャッシュヘッダーを設定
 	w.Header().Set("Content-Type", getMimeType(ext))
+	w.Header().Set("Cache-Control", "public, max-age=31536000") // 1年間キャッシュ
+	w.Header().Set("ETag", fmt.Sprintf(`"%x"`, sha256.Sum256(imgdata)))
+
+	// If-None-Matchヘッダーをチェック
+	if match := r.Header.Get("If-None-Match"); match != "" {
+		if match == fmt.Sprintf(`"%x"`, sha256.Sum256(imgdata)) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
+
 	_, err = w.Write(imgdata)
 	if err != nil {
 		log.Print(err)
