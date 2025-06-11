@@ -204,8 +204,12 @@ func calculatePasshash(accountName, password string) string {
 }
 
 func getSession(r *http.Request) *sessions.Session {
-	session, _ := store.Get(r, "isuconp-go.session")
-
+	session, err := store.Get(r, "isuconp-go.session")
+	if err != nil {
+		log.Printf("Failed to get session: %v", err)
+		// エラー時は新しいセッションを作成
+		session, _ = store.New(r, "isuconp-go.session")
+	}
 	return session
 }
 
@@ -217,9 +221,9 @@ func getSessionUser(r *http.Request) User {
 	}
 
 	u := User{}
-
-	err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
+	err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ? AND `del_flg` = 0", uid)
 	if err != nil {
+		log.Printf("Failed to get user: %v", err)
 		return User{}
 	}
 
@@ -402,8 +406,11 @@ func isLogin(u User) bool {
 func getCSRFToken(r *http.Request) string {
 	session := getSession(r)
 	csrfToken, ok := session.Values["csrf_token"]
-	if !ok {
-		return ""
+	if !ok || csrfToken == nil {
+		// CSRFトークンが存在しない場合は新しく生成
+		csrfToken = secureRandomStr(16)
+		session.Values["csrf_token"] = csrfToken
+		session.Save(r, nil)
 	}
 	return csrfToken.(string)
 }
