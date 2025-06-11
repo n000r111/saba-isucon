@@ -173,49 +173,140 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
 	var posts []Post
+	if len(results) == 0 {
+		return posts, nil
+	}
 
+	// 投稿IDのリストを作成
+	postIDs := make([]int, 0, len(results))
 	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+		postIDs = append(postIDs, p.ID)
+	}
+
+	// コメント数とユーザー情報を一括取得
+	query := `
+		SELECT 
+			p.id as post_id,
+			COUNT(c.id) as comment_count,
+			u.id as user_id,
+			u.account_name,
+			u.authority,
+			u.del_flg,
+			u.created_at as user_created_at
+		FROM posts p
+		LEFT JOIN users u ON p.user_id = u.id
+		LEFT JOIN comments c ON p.id = c.post_id
+		WHERE p.id IN (?)
+		GROUP BY p.id, u.id
+	`
+	query, args, err := sqlx.In(query, postIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	// 投稿情報をマップに格納
+	postMap := make(map[int]*Post)
+	for _, p := range results {
+		postMap[p.ID] = &p
+	}
+
+	rows, err := db.Queryx(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var postID, userID, commentCount int
+		var accountName string
+		var authority, delFlg int
+		var userCreatedAt time.Time
+
+		err := rows.Scan(&postID, &commentCount, &userID, &accountName, &authority, &delFlg, &userCreatedAt)
 		if err != nil {
 			return nil, err
 		}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
-		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
-		if err != nil {
-			return nil, err
-		}
-
-		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
+		if post, ok := postMap[postID]; ok {
+			post.CommentCount = commentCount
+			post.User = User{
+				ID:          userID,
+				AccountName: accountName,
+				Authority:   authority,
+				DelFlg:      delFlg,
+				CreatedAt:   userCreatedAt,
 			}
 		}
+	}
 
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
-		}
+	// コメントを一括取得
+	commentQuery := `
+		SELECT 
+			c.*,
+			u.id as user_id,
+			u.account_name,
+			u.authority,
+			u.del_flg,
+			u.created_at as user_created_at
+		FROM comments c
+		JOIN users u ON c.user_id = u.id
+		WHERE c.post_id IN (?)
+	`
+	if !allComments {
+		commentQuery += ` AND c.id IN (
+			SELECT id FROM comments 
+			WHERE post_id = c.post_id 
+			ORDER BY created_at DESC 
+			LIMIT 3
+		)`
+	}
+	commentQuery += ` ORDER BY c.created_at DESC`
 
-		p.Comments = comments
+	commentQuery, args, err = sqlx.In(commentQuery, postIDs)
+	if err != nil {
+		return nil, err
+	}
 
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
+	rows, err = db.Queryx(commentQuery, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	commentsMap := make(map[int][]Comment)
+	for rows.Next() {
+		var comment Comment
+		var user User
+		err := rows.Scan(
+			&comment.ID,
+			&comment.PostID,
+			&comment.UserID,
+			&comment.Comment,
+			&comment.CreatedAt,
+			&user.ID,
+			&user.AccountName,
+			&user.Authority,
+			&user.DelFlg,
+			&user.CreatedAt,
+		)
 		if err != nil {
 			return nil, err
 		}
+		comment.User = user
+		commentsMap[comment.PostID] = append(commentsMap[comment.PostID], comment)
+	}
 
-		p.CSRFToken = csrfToken
-
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
-		}
-		if len(posts) >= postsPerPage {
-			break
+	// 結果を組み立てる
+	for _, p := range results {
+		if post, ok := postMap[p.ID]; ok {
+			post.Comments = commentsMap[p.ID]
+			post.CSRFToken = csrfToken
+			if post.User.DelFlg == 0 {
+				posts = append(posts, *post)
+			}
+			if len(posts) >= postsPerPage {
+				break
+			}
 		}
 	}
 
