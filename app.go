@@ -2,6 +2,8 @@ package main
 
 import (
 	crand "crypto/rand"
+	"crypto/sha512"
+	"encoding/hex"
 	"fmt"
 	"html/template"
 	"io"
@@ -9,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path"
 	"regexp"
 	"strconv"
@@ -117,14 +118,9 @@ func escapeshellarg(arg string) string {
 }
 
 func digest(src string) string {
-	// opensslのバージョンによっては (stdin)= というのがつくので取る
-	out, err := exec.Command("/bin/bash", "-c", `printf "%s" `+escapeshellarg(src)+` | openssl dgst -sha512 | sed 's/^.*= //'`).Output()
-	if err != nil {
-		log.Print(err)
-		return ""
-	}
-
-	return strings.TrimSuffix(string(out), "\n")
+	hasher := sha512.New()
+	hasher.Write([]byte(src))
+	return hex.EncodeToString(hasher.Sum(nil))
 }
 
 func calculateSalt(accountName string) string {
