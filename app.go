@@ -256,12 +256,16 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			LIMIT 3
 		)`
 	}
-	commentQuery += ` ORDER BY c.created_at DESC`
+	commentQuery += ` ORDER BY c.created_at DESC LIMIT ?`
 
 	commentQuery, args, err = sqlx.In(commentQuery, postIDs)
 	if err != nil {
 		return nil, err
 	}
+
+	// コメントの最大数を計算（投稿数 × 3）
+	maxComments := len(postIDs) * 3
+	args = append(args, maxComments)
 
 	rows, err = db.Queryx(commentQuery, args...)
 	if err != nil {
@@ -299,9 +303,6 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			post.CSRFToken = csrfToken
 			if post.User.DelFlg == 0 {
 				posts = append(posts, *post)
-			}
-			if len(posts) >= postsPerPage {
-				break
 			}
 		}
 	}
@@ -473,7 +474,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
+	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT ?", postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -519,7 +520,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
+	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT ?", user.ID, postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
