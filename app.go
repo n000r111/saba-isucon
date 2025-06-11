@@ -28,6 +28,15 @@ import (
 var (
 	db    *sqlx.DB
 	store *gsm.MemcacheStore
+
+	// テンプレートのキャッシュ
+	templates = struct {
+		layout *template.Template
+		index  *template.Template
+		user   *template.Template
+		posts  *template.Template
+		post   *template.Template
+	}{}
 )
 
 const (
@@ -75,6 +84,41 @@ func init() {
 	memcacheClient := memcache.New(memdAddr)
 	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+
+	// テンプレートの初期化
+	fmap := template.FuncMap{
+		"imageURL": imageURL,
+	}
+
+	// レイアウトテンプレート
+	templates.layout = template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
+		getTemplPath("layout.html"),
+	))
+
+	// インデックスページ
+	templates.index = template.Must(template.New("index.html").Funcs(fmap).ParseFiles(
+		getTemplPath("index.html"),
+		getTemplPath("posts.html"),
+		getTemplPath("post.html"),
+	))
+
+	// ユーザーページ
+	templates.user = template.Must(template.New("user.html").Funcs(fmap).ParseFiles(
+		getTemplPath("user.html"),
+		getTemplPath("posts.html"),
+		getTemplPath("post.html"),
+	))
+
+	// 投稿一覧
+	templates.posts = template.Must(template.New("posts.html").Funcs(fmap).ParseFiles(
+		getTemplPath("posts.html"),
+		getTemplPath("post.html"),
+	))
+
+	// 個別投稿
+	templates.post = template.Must(template.New("post.html").Funcs(fmap).ParseFiles(
+		getTemplPath("post.html"),
+	))
 }
 
 func dbInitialize() {
@@ -486,16 +530,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("index.html"),
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	templates.layout.ExecuteTemplate(w, "layout.html", struct {
 		Posts     []Post
 		Me        User
 		CSRFToken string
@@ -570,16 +605,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	me := getSessionUser(r)
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("user.html"),
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	templates.layout.ExecuteTemplate(w, "layout.html", struct {
 		Posts          []Post
 		User           User
 		PostCount      int
@@ -625,14 +651,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("posts.html").Funcs(fmap).ParseFiles(
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, posts)
+	templates.posts.ExecuteTemplate(w, "posts.html", posts)
 }
 
 func getPostsID(w http.ResponseWriter, r *http.Request) {
@@ -665,15 +684,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 
 	me := getSessionUser(r)
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("post_id.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	templates.layout.ExecuteTemplate(w, "layout.html", struct {
 		Post Post
 		Me   User
 	}{p, me})
