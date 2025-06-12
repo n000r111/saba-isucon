@@ -27,6 +27,9 @@ import (
 	"sync"
 	"time"
 
+	"crypto/sha512" // ★追加
+	"encoding/hex"  // ★追加
+
 	"github.com/bradfitz/gomemcache/memcache"
 	gsm "github.com/bradleypeabody/gorilla-sessions-memcache"
 	"github.com/go-chi/chi/v5"
@@ -158,11 +161,33 @@ func dbInitialize() {
 		"UPDATE users SET del_flg = 1 WHERE id % 50 = 0",
 	}
 
+	// 既存のDELETE/UPDATE文の後に、CREATE INDEX文を追記します
+	sqls = append(sqls,
+		// posts の created_at にインデックス (トップページなど)
+		"CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at DESC)",
+		// users の account_name にインデックス (ログイン、ユーザーページ)
+		"CREATE INDEX IF NOT EXISTS idx_users_account_name ON users(account_name)",
+		// comments の user_id にインデックス (ユーザーのコメント数)
+		"CREATE INDEX IF NOT EXISTS idx_comments_user_id ON comments(user_id)",
+		// posts の user_id と created_at に複合インデックス (ユーザーページ投稿一覧)
+		"CREATE INDEX IF NOT EXISTS idx_posts_user_created_at ON posts(user_id, created_at DESC)",
+		// comments の post_id にインデックス (投稿のコメント数、コメント取得)
+		"CREATE INDEX IF NOT EXISTS idx_comments_post_id ON comments(post_id)",
+		// comments の user_id に複合インデックス (コメントユーザー情報取得)
+		// makePosts内でコメントユーザ情報を取得するために必要だが、post_idに加えてuser_idも含めると良い場合もある
+		"CREATE INDEX IF NOT EXISTS idx_comments_user_id_post_id ON comments(user_id, post_id)",
+
+		// 必要に応じて他のインデックスも追加
+	)
+
 	for _, sql := range sqls {
-		db.Exec(sql)
+		_, err := db.Exec(sql)
+		if err != nil {
+			// エラーログを出すことで、どのインデックスが失敗したか分かるようにする
+			log.Printf("Failed to execute SQL in dbInitialize: %s, Error: %v", sql, err)
+		}
 	}
 }
-
 func tryLogin(accountName, password string) *User {
 	u := User{}
 	err := db.Get(&u, "SELECT * FROM users WHERE account_name = ? AND del_flg = 0", accountName)
